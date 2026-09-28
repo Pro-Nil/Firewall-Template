@@ -1,30 +1,40 @@
 #!/bin/sh
 
 # ==================================================
-# Firewall Rules by Gaetan
-# Discord: 'gaetandev' for support
-# Version: 1.4
+# General-purpose server firewall (iptables)
+# Adapted from Gaetan's rules v1.4 (Minecraft-specific)
 # ==================================================
 #
 # DISCLAIMER:
-# - Use these rules at your own risk.
-# - Ensure your hosting provider allows these rules.
-# - These rules do not replace a network anti-DDoS protection.
-# - Modify the "Whitelist your own port" section as needed.
+# - Use at your own risk. Confirm your host allows these rules.
+# - This is host-level filtering, NOT a network anti-DDoS.
+# - Set TCP_PORTS / UDP_PORTS and SSH_PORT before running.
+# - Run from a console you won't lose (KVM/IPMI) the first time,
+#   in case SSH is misconfigured.
 #
 # ==================================================
 
 echo "[Firewall] Loading..."
 
 # ==================================================
-# Define variables
+# Configuration
 # ==================================================
 IPTABLES="sudo iptables"
 IPSET="sudo ipset"
-MINECRAFT_PORT="25565"
-SSH_PORT="52839"
-BURSTCONNSTIMESTAMP=3 # Limits new connections per second with timestamp.
-                      # Useful against attacks and spambots.
+
+SSH_PORT="22"                 # change to your real SSH port
+TCP_PORTS="80 443"            # public TCP services (space-separated)
+UDP_PORTS=""                  # public UDP services, e.g. "53 1194"
+
+# Ports restricted to specific source IPs: "port ip1,ip2 ..."
+RESTRICTED="3306 127.0.0.1,1.1.1.1"
+
+# Rate limiting for NEW connections (per source IP)
+NEWCONN_SECONDS=60
+NEWCONN_HITCOUNT=20
+
+# Optional: only accept 443 from Cloudflare IPs (set to 1 if behind CF)
+CLOUDFLARE_ONLY_443=0
 
 # ==================================================
 # Reset rules
@@ -37,63 +47,100 @@ $IPTABLES -t raw -F
 $IPTABLES -t raw -X
 echo "[Firewall] Rules reset."
 
-# Default policy: allow all traffic temporarily
-$IPTABLES -t filter -P INPUT ACCEPT
-$IPTABLES -t filter -P FORWARD ACCEPT
-$IPTABLES -t filter -P OUTPUT ACCEPT
-echo "[Firewall] All traffic temporarily allowed."
-
-$IPTABLES -N DOCKER
-$IPTABLES -F DOCKER
+# Temporarily allow everything while we build the ruleset,
+# so we never lock ourselves out mid-configuration.
+$IPTABLES -P INPUT ACCEPT
+$IPTABLES -P FORWARD ACCEPT
+$IPTABLES -P OUTPUT ACCEPT
 
 # ==================================================
-# TCP handshake protection
+# Base allows (loopback + established/related)
 # ==================================================
-$IPTABLES -t mangle -A PREROUTING -p tcp -m conntrack --ctstate ESTABLISHED -j ACCEPT
-$IPTABLES -t mangle -A PREROUTING -p tcp ! --tcp-flags ALL SYN -j DROP
+$IPTABLES -A INPUT -i lo -j ACCEPT
+$IPTABLES -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+$IPTABLES -A INPUT -m conntrack --ctstate INVALID -j DROP
+echo "[Firewall] Loopback + established traffic allowed, invalid dropped."
+
+# ==================================================
+# TCP handshake / malformed packet protection (mangle)
+# ==================================================
+$IPTABLES -t mangle -A PREROUTING -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+$IPTABLES -t mangle -A PREROUTING -m conntrack --ctstate INVALID -j DROP
+$IPTABLES -t mangle -A PREROUTING -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
 echo "[Firewall] TCP handshake protection enabled."
 
-# Drop invalid packets
-$IPTABLES -t mangle -A PREROUTING -m conntrack --ctstate INVALID -j DROP
-echo "[Firewall] Dropping invalid packets."
+# Allow ICMP (ping) with a rate limit
+$IPTABLES -A INPUT -p icmp --icmp-type echo-request -m limit --limit 5/s -j ACCEPT
 
 # ==================================================
-# Whitelist allowed ports
+# SSH: allow, with brute-force rate limiting
 # ==================================================
-$IPSET -exist destroy cloudflare
-$IPSET create cloudflare hash:net
-curl -s https://www.cloudflare.com/ips-v4 | while read line; do $IPSET add cloudflare $line; done
+$IPTABLES -A INPUT -p tcp --dport $SSH_PORT -m conntrack --ctstate NEW -m recent --set --name SSH
+$IPTABLES -A INPUT -p tcp --dport $SSH_PORT -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 10 --name SSH -j DROP
+$IPTABLES -A INPUT -p tcp --dport $SSH_PORT -j ACCEPT
+echo "[Firewall] SSH allowed on port $SSH_PORT (rate limited)."
 
-$IPTABLES -A INPUT -p tcp --dport 443 -m set --match-set cloudflare src -j ACCEPT
-$IPTABLES -A INPUT -p tcp --dport 443 -j DROP
-echo "[Firewall] Cloudflare HTTPS whitelist applied."
-
-# Specific whitelist (example: MariaDB)
-for ip in 127.0.0.1 1.1.1.1; do
-    $IPTABLES -A INPUT -p tcp --dport 3306 -s $ip -j ACCEPT
+# ==================================================
+# Public TCP ports (with NEW-connection rate limiting)
+# ==================================================
+for port in $TCP_PORTS; do
+    if [ "$port" = "443" ] && [ "$CLOUDFLARE_ONLY_443" = "1" ]; then
+        $IPSET -exist destroy cloudflare
+        $IPSET create cloudflare hash:net
+        curl -s https://www.cloudflare.com/ips-v4 | while read line; do $IPSET add cloudflare $line; done
+        $IPTABLES -A INPUT -p tcp --dport 443 -m set --match-set cloudflare src -j ACCEPT
+        $IPTABLES -A INPUT -p tcp --dport 443 -j DROP
+        echo "[Firewall] Port 443 restricted to Cloudflare."
+        continue
+    fi
+    $IPTABLES -A INPUT -p tcp --dport $port -m conntrack --ctstate NEW \
+        -m recent --set --name P$port
+    $IPTABLES -A INPUT -p tcp --dport $port -m conntrack --ctstate NEW \
+        -m recent --update --seconds $NEWCONN_SECONDS --hitcount $NEWCONN_HITCOUNT --name P$port -j DROP
+    $IPTABLES -A INPUT -p tcp --dport $port -j ACCEPT
+    echo "[Firewall] TCP port $port allowed."
 done
-$IPTABLES -A INPUT -p tcp --dport 3306 -j DROP
-echo "[Firewall] MariaDB whitelist applied."
 
 # ==================================================
-# Connection rate limiting per IP
+# Public UDP ports
 # ==================================================
-$IPTABLES -A INPUT -p tcp --dport $SSH_PORT -m conntrack --ctstate NEW -m recent --set
-$IPTABLES -A INPUT -p tcp --dport $SSH_PORT -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 10 -j DROP
-echo "[Firewall] SSH connection rate limiting enabled."
+for port in $UDP_PORTS; do
+    $IPTABLES -A INPUT -p udp --dport $port -j ACCEPT
+    echo "[Firewall] UDP port $port allowed."
+done
 
 # ==================================================
-# Experimental rules (Use with caution)
-# /!\ Don't use it with TCPShield, HAProxy (or alternatives..) /!\
+# Restricted ports (only specific source IPs)
 # ==================================================
-$IPTABLES -t mangle -A PREROUTING -p tcp --dport $MINECRAFT_PORT -m tcp --syn --tcp-option 8 -m limit --limit $BURSTCONNSTIMESTAMP/s -j ACCEPT
-$IPTABLES -t mangle -A PREROUTING -p tcp --dport $MINECRAFT_PORT -m tcp --syn --tcp-option 8 -j DROP
-echo "[Firewall] TCP Timestamp flood protection for Minecraft port applied."
+for entry in $RESTRICTED; do
+    case "$entry" in
+        */*) ;;                       # skip stray tokens
+        *)
+            port="$entry"
+            ips="$next"               # not used; handled below
+            ;;
+    esac
+done
 
-# Connection rate limiting per IP (anti-spam)
-$IPTABLES -t mangle -A PREROUTING -p tcp --dport $MINECRAFT_PORT -m state --state NEW -m recent --set --name MINECRAFT --mask 255.255.255.255 --rsource
-$IPTABLES -t mangle -A PREROUTING -p tcp --dport $MINECRAFT_PORT -m state --state NEW -m recent --update --seconds 3 --hitcount 20 --name MINECRAFT --mask 255.255.255.255 --rsource -j DROP
-echo "[Firewall] TCP Basic flood protection for Minecraft port applied."
+# Simpler restricted handling: iterate pairs
+set -- $RESTRICTED
+while [ $# -ge 2 ]; do
+    port="$1"; iplist="$2"; shift 2
+    IFS=','
+    for ip in $iplist; do
+        $IPTABLES -A INPUT -p tcp --dport $port -s $ip -j ACCEPT
+    done
+    unset IFS
+    $IPTABLES -A INPUT -p tcp --dport $port -j DROP
+    echo "[Firewall] Port $port restricted to: $iplist"
+done
 
 # ==================================================
+# Default policy: DENY everything not explicitly allowed
+# ==================================================
+$IPTABLES -P INPUT DROP
+$IPTABLES -P FORWARD DROP
+$IPTABLES -P OUTPUT ACCEPT
+echo "[Firewall] Default-deny policy applied."
+
 echo "[Firewall] Configuration successfully completed."
